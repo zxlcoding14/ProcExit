@@ -1,33 +1,101 @@
-﻿# Shortcut Trigger
+﻿# 快捷键触发
 
-## Configuration
+## 配置
 
-The application reads `shortcuts.ini` from the same directory as the executable. The Visual Studio project copies the sample configuration to the build output directory. Add entries under `[Shortcuts]`; the text before `=` is the button label and the text after it is the simulated key combination.
+程序从可执行文件所在目录读取 `shortcuts.ini`。Visual Studio 工程会把示例配置复制到构建输出目录。
+
+文件按分类分段，段名只用于组织文件、保证条目名不重复，不会显示在界面上。段内的每一行是一个快捷键条目，等号左边是条目名称，右边是要模拟的按键组合。
 
 ```ini
-[Shortcuts]
-Copy=Ctrl+C
-Open Search=Ctrl+F
-Refresh=F5
+[系统与全局]
+运行=Win+R
+
+[浏览器常用]
+新建标签页=Ctrl+T
+刷新页面=Ctrl+R
 ```
 
-Supported modifiers are `Ctrl`, `Alt`, `Shift`, and `Win`. Supported keys are A-Z, 0-9, F1-F24, `Space`, `Enter`, `Tab`, `Esc`, `Delete`, and `Backspace`. Invalid entries are skipped.
+文件以 UTF-16LE 加 BOM 保存，这样中文名称在读写时都能保持一致。程序保存配置时也会用同样的编码重写整个文件。
 
-## Behavior and limitations
+支持的修饰键为 `Ctrl`、`Alt`、`Shift`、`Win`。支持的按键为：
 
-The window creates one button per valid entry, lays them out in four columns, and reflows them on resize. Clicking a button sends the modifier and key events through `SendInput` to whichever application is active at that moment. Avoid clicking the trigger window immediately before selecting a target application; select the target first and activate the trigger only when ready to send.
+| 类别 | 可用写法 |
+| --- | --- |
+| 字母和数字 | `A`-`Z`、`0`-`9` |
+| 功能键 | `F1`-`F24` |
+| 编辑键 | `Space`、`Enter`、`Tab`、`Esc`、`Delete`、`Backspace`、`Insert` |
+| 方向键 | `Left`、`Right`、`Up`、`Down` |
+| 定位键 | `Home`、`End`、`PageUp`、`PageDown` |
+| 符号键 | `Plus`、`Minus`、`Period`、`Comma`、`Semicolon`、`Slash` |
+| 其他 | `PrintScreen`、`Pause`、`NumLock` |
 
-Windows may reject simulated input across integrity levels or to protected/secure desktop applications. `SendInput` reports failure in the status line; run both applications at the same privilege level. Shortcut buttons do not target a specific process.
+单独写一个修饰键表示只按下该修饰键，例如 `开始菜单=Win` 就是单独按 Win 键。
 
-## Mouse right-click trigger
+非法条目会被跳过，不参与解析的条目不会出现在面板中。同一条目中重复的修饰键、出现多个主键、`F0` 或 `F25` 这类越界的名称，以及无法识别的名称都会被判定为非法。`Ctrl+Ctrl+C`、`Ctrl+A+B` 之类的写法不会被接受。
 
-Open **File > Settings...** to edit the mouse right-click shortcut. The setting is stored separately from the shortcut buttons in `settings.ini`:
+## 快捷键悬浮窗
+
+点击主窗口中的触发入口后，程序才会创建并显示一个独立的无标题栏悬浮窗。窗口为白色背景，按 `shortcuts.ini` 中的顺序显示所有有效快捷键。**每个按钮上只显示按键组合本身**，条目名称只用于配置文件的组织，不上屏。它与主窗口相互独立：主窗口标题栏不显示该面板，面板也不会出现在任务栏中。
+
+可以用以下方式显示或隐藏面板：
+
+- 主窗口按钮行上的 **Shortcuts** 按钮。
+- 主窗口菜单 **文件 > Shortcut Panel**。
+- 面板底部的 **Close** 按钮只隐藏浮窗，不退出程序。
+
+面板会根据当前宽度自动决定每行放几个条目，条目宽度均分整行。窗口较宽时一行可以放下 10 个以上条目，窗口变窄时列数自动减少。按钮为白底细边框，鼠标移到按钮上时边框变蓝、底色变浅。
+
+按键组合在按钮里放不下时，按钮上的文字会被截断。鼠标悬停到这类按钮上会弹出一个提示，按一行显示完整的组合。判定方式和绘制一致：用按钮当前的字体，按按钮实际可用的文字宽度（已扣除右侧关闭区）量一次，装不下才提示，能完整显示的按钮不会弹出多余的提示。
+
+拖动窗口边缘可以调整面板大小，调整后条目会立即重新排版。窗口有最小尺寸限制：缩到最小时仍然可以完整显示 3 行 3 列的条目，更小的拖动会被系统拒绝。条目内容超出一屏时，面板右侧出现垂直滚动条，可以用滚轮或拖动滚动条查看其余条目。滚动时只显示完整行，不会与底部的操作区重叠。
+
+按住面板空白区域并拖动鼠标可以移动窗口。面板本身不会抢占焦点，点击快捷键按钮不会把焦点从目标应用切走，模拟按键仍发送给当前处于活动状态的应用程序。
+
+关闭面板只会隐藏窗口，不会退出程序。真正的退出入口仍然是主窗口。
+
+## 添加和删除快捷键
+
+面板底部的 **Add Shortcut** 按钮会打开一个输入对话框，只需要提供按键组合：既可以直接按下键盘按键录制，也可以手工输入文本，填写完成后点击 **Add** 即可。不需要填写条目名称，新增的条目统一放在 `自定义` 分类下，名称直接取按键组合文本（界面上只显示组合，名称仅用于配置文件）。
+
+录制时按下的组合会立即回显到输入框，写法按 `Ctrl+Alt+Shift+Win+主键` 的顺序规范化，与手工输入的文本完全等价。以下按键保持对话框本来的行为，不会被录制，需要它们作为主键时请手工输入：
+
+- 没有修饰键时的 `Tab`、`Enter`、`Esc`，分别用于切换焦点、确认和取消。
+- 没有修饰键时的字母、数字、空格和退格，照常输入到输入框，便于改正录错的内容。
+
+`Win` 组合会被系统抢先响应，例如按下 `Win+R` 会同时打开“运行”对话框，这类组合建议直接手工输入。
+
+新增时会做以下校验：
+
+- 按键组合不能为空，且必须合法。
+- 不能与 `自定义` 分类下已有条目的组合重复。比较基于解析后的修饰键和主键，不依赖文本顺序，也不区分 `ctrl` 和 `Ctrl` 这类写法差异。
+
+每个按钮的右侧有一条关闭区，鼠标移上去会变成红色并显示白色的 `×`，点击立即删除该条目，不再二次确认。关闭区和按钮本身是同一个控件，因此不会出现点到关闭区却触发快捷键的情况。删除后的顺序会随其余条目一起写回，保存失败时会回滚。
+
+新增和删除都会立即生效、立即重排，并立即写回可执行文件目录下的 `shortcuts.ini`。写入失败时会回滚内存中的改动，面板上原有的条目保持不变，并显示错误提示。需要注意 `shortcuts.ini` 会被整段重写，文件中的注释不会保留，但条目的先后顺序会保留。
+
+## 调整顺序
+
+按住任意快捷键按钮拖动即可调整它在面板中的位置，拖动过程中目标位置会以橙色粗边框标出，松手后立即生效。移动距离小于系统的拖动阈值时仍然按一次普通点击处理，也就是触发该快捷键，因此轻微的手抖不会误触发排序。
+
+条目在文件中的先后顺序就是面板的显示顺序，调整后的顺序会随其他改动一起写回 `shortcuts.ini`，重启后保持不变。把条目拖到其他分类中间时，同一个分类名会在文件里出现多次，这是正常现象，程序按行读取，顺序不会丢失。
+
+## 行为与限制
+
+点击条目后，程序通过 `SendInput` 把修饰键和主键事件发送给当时处于活动状态的应用程序。
+
+不要在点击触发按钮之前才切换目标应用，应先选中目标窗口，准备好之后再点击触发按钮。
+
+Windows 可能拒绝跨完整性级别或向受保护/安全桌面的应用发送模拟输入，`Ctrl+Alt+Delete` 这类安全注意序列也无法由 `SendInput` 触发。`SendInput` 失败时状态栏会给出提示，请让两个程序运行在相同的权限级别。快捷键按钮不针对特定进程。
+
+## 鼠标右键触发
+
+打开 **文件 > Settings...** 可以编辑鼠标右键触发的快捷键。该设置与快捷键按钮分开存放，保存在 `settings.ini` 中：
 
 ```ini
 [MouseTrigger]
 Shortcut=Ctrl+Shift+1
 ```
 
-Move the pointer to the target position and press the configured hotkey. The application captures the current screen coordinates, waits until the hotkey and its modifiers are released, and then sends a right-click at the captured position. This feature does not install a global mouse hook and does not listen for mouse clicks.
+把鼠标指针移动到目标位置，然后按下配置的热键即可。程序会记录当前屏幕坐标，等待热键及其修饰键释放，然后在记录的坐标处发送一次右键。该功能不安装全局鼠标钩子，也不会监听鼠标点击。
 
-Only one mouse trigger hotkey can be configured. If `settings.ini` is missing, the application uses `Ctrl+Shift+1` as the built-in default. Changes saved from the settings dialog take effect immediately. Use at least one modifier to avoid globally reserving a normal typing key. If the combination is already registered by another application, the previous shortcut remains active and the diagnostic log records the error. The trigger is canceled if its keys remain pressed for five seconds. Simulated mouse input remains subject to Windows integrity-level and secure-desktop restrictions.
+鼠标触发只能配置一个热键。如果缺少 `settings.ini`，程序使用内置默认值 `Ctrl+Shift+1`。设置对话框保存后立即生效。为避免全局占用普通输入按键，组合中至少需要一个修饰键。如果该组合已被其他程序注册，程序会保留原有快捷键，并在诊断日志中记录错误。按键持续按下超过五秒，本次触发会被取消。模拟鼠标输入同样受 Windows 完整性级别和安全桌面限制的约束。
