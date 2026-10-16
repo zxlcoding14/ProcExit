@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #pragma comment(lib, "Comctl32.lib")
@@ -60,6 +61,7 @@ static HWND g_taskbarMenuButton = nullptr;
 static HWND g_copyLogsButton = nullptr;
 static HWND g_shortcutPanelButton = nullptr;
 static HWND g_settingsButton = nullptr;
+static HWND g_programExitButton = nullptr;
 static HWND g_mainMinimizeButton = nullptr;
 static HWND g_mainCloseButton = nullptr;
 static std::thread g_exitWorker;
@@ -80,6 +82,9 @@ static constexpr int ID_SHORTCUT_MINIMIZE = 1914;
 static constexpr int ID_MAIN_MINIMIZE = 1911;
 static constexpr int ID_MAIN_CLOSE = 1912;
 static constexpr int ID_MAIN_SETTINGS = 1913;
+static constexpr int ID_SHORTCUT_CLEAR = 1915;
+static constexpr int ID_SHORTCUT_RESET = 1916;
+static constexpr int ID_MAIN_EXIT_PROGRAM = 1917;
 static constexpr int MAIN_TITLE_BAR_HEIGHT = 32;
 static constexpr int ID_SHORTCUT_SEND_BASE = 2000;
 static constexpr int ID_SHORTCUT_DELETE_BASE = 3000;
@@ -89,6 +94,8 @@ static constexpr wchar_t SHORTCUT_CUSTOM_CATEGORY[] = L"自定义";
 static HWND g_shortcutWindow = nullptr;
 static std::vector<char> g_shortcutButtonHover;
 static HWND g_shortcutAddButton = nullptr;
+static HWND g_shortcutClearButton = nullptr;
+static HWND g_shortcutResetButton = nullptr;
 static HWND g_shortcutCloseButton = nullptr;
 static HWND g_shortcutMinimizeButton = nullptr;
 static HWND g_shortcutHintText = nullptr;
@@ -702,17 +709,11 @@ static bool ReadConfigurationText(const std::wstring& path, std::wstring& text)
 
 // 直接按行解析：拖动调整顺序后同一个分类可能在文件里出现多次，
 // Profile API 只会读到第一段，所以这里自己读。
-static void LoadShortcuts()
+static bool ParseShortcutsText(const std::wstring& text, std::vector<ShortcutItem>& shortcuts, bool rejectInvalid = false)
 {
-    std::wstring configPath = GetConfigurationPath(L"shortcuts.ini");
-    if (configPath.empty()) return;
-
-    std::wstring text;
-    if (!ReadConfigurationText(configPath, text)) return;
-
     std::wstring category;
     size_t position = 0;
-    while (position < text.size() && g_shortcuts.size() < MAX_SHORTCUTS)
+    while (position < text.size() && shortcuts.size() < MAX_SHORTCUTS)
     {
         size_t lineEnd = text.find(L'\n', position);
         if (lineEnd == std::wstring::npos) lineEnd = text.size();
@@ -727,14 +728,57 @@ static void LoadShortcuts()
         }
 
         size_t separator = line.find(L'=');
-        if (separator == std::wstring::npos) continue;
+        if (separator == std::wstring::npos)
+        {
+            if (rejectInvalid) return false;
+            continue;
+        }
         ShortcutItem item = {};
         item.category = category;
         item.name = Trim(line.substr(0, separator));
         item.shortcut = Trim(line.substr(separator + 1));
-        if (item.name.empty()) continue;
-        if (ParseShortcut(item.shortcut, item)) g_shortcuts.push_back(item);
+        if (item.name.empty() || !ParseShortcut(item.shortcut, item))
+        {
+            if (rejectInvalid) return false;
+            continue;
+        }
+        shortcuts.push_back(item);
     }
+    return !rejectInvalid || position >= text.size();
+}
+
+static void LoadShortcuts()
+{
+    std::wstring configPath = GetConfigurationPath(L"shortcuts.ini");
+    if (configPath.empty()) return;
+
+    std::wstring text;
+    if (!ReadConfigurationText(configPath, text)) return;
+
+    std::vector<ShortcutItem> shortcuts;
+    ParseShortcutsText(text, shortcuts);
+    g_shortcuts = std::move(shortcuts);
+}
+
+static bool LoadDefaultShortcuts(std::vector<ShortcutItem>& shortcuts)
+{
+    HRSRC resource = FindResourceW(hInst, MAKEINTRESOURCEW(IDR_DEFAULT_SHORTCUTS), RT_RCDATA);
+    if (resource == nullptr)
+        return false;
+    HGLOBAL loaded = LoadResource(hInst, resource);
+    const void* data = loaded != nullptr ? LockResource(loaded) : nullptr;
+    DWORD size = SizeofResource(hInst, resource);
+    if (data == nullptr || size < 2 || (size - 2) % sizeof(wchar_t) != 0)
+        return false;
+
+    const unsigned char* bytes = static_cast<const unsigned char*>(data);
+    if (bytes[0] != 0xFF || bytes[1] != 0xFE)
+        return false;
+
+    std::wstring text;
+    text.resize((size - 2) / sizeof(wchar_t));
+    if (!text.empty()) memcpy(&text[0], bytes + 2, text.size() * sizeof(wchar_t));
+    return ParseShortcutsText(text, shortcuts, true) && !shortcuts.empty();
 }
 
 static bool LoadMouseTrigger()
@@ -912,7 +956,7 @@ static void LayoutMainWindow(HWND hWnd)
     int listHeight = client.bottom - listTop - 40;
     if (listHeight < 40) listHeight = 40;
 
-    HDWP defer = BeginDeferWindowPos(10);
+    HDWP defer = BeginDeferWindowPos(11);
     auto place = [&defer](HWND window, int x, int y, int width, int height) {
         if (window == nullptr || defer == nullptr) return;
         defer = DeferWindowPos(defer, window, nullptr, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -926,7 +970,8 @@ static void LayoutMainWindow(HWND hWnd)
     place(g_shortcutPanelButton, margin + 540, top, 110, buttonHeight);
     place(g_settingsButton, margin + 660, top, 100, buttonHeight);
     place(g_processList, margin, listTop, client.right - margin * 2, listHeight);
-    place(g_statusText, margin, client.bottom - 30, client.right - margin * 2, 20);
+    place(g_statusText, margin, client.bottom - 30, client.right - margin * 2 - 114, 20);
+    place(g_programExitButton, client.right - margin - 104, client.bottom - 34, 104, 26);
     if (defer != nullptr) EndDeferWindowPos(defer);
 }
 
@@ -1152,9 +1197,17 @@ static void LayoutShortcutPanel(HWND hWnd)
     int footerTop = client.bottom - SHORTCUT_PANEL_FOOTER + 4;
     if (g_shortcutAddButton != nullptr)
         MoveWindow(g_shortcutAddButton, SHORTCUT_PANEL_MARGIN, footerTop, 86, 22, TRUE);
+    if (g_shortcutClearButton != nullptr)
+        MoveWindow(g_shortcutClearButton, SHORTCUT_PANEL_MARGIN + 92, footerTop, 68, 22, TRUE);
+    if (g_shortcutResetButton != nullptr)
+        MoveWindow(g_shortcutResetButton, SHORTCUT_PANEL_MARGIN + 166, footerTop, 58, 22, TRUE);
     if (g_shortcutHintText != nullptr)
-        MoveWindow(g_shortcutHintText, SHORTCUT_PANEL_MARGIN + 94, footerTop + 3,
-            client.right - SHORTCUT_PANEL_MARGIN * 2 - 94, 16, TRUE);
+    {
+        int hintWidth = client.right - SHORTCUT_PANEL_MARGIN * 2 - 232;
+        ShowWindow(g_shortcutHintText, hintWidth >= 120 ? SW_SHOWNA : SW_HIDE);
+        MoveWindow(g_shortcutHintText, SHORTCUT_PANEL_MARGIN + 232, footerTop + 3,
+            hintWidth > 0 ? hintWidth : 0, 16, TRUE);
+    }
 }
 
 static void HideShortcutTooltip();
@@ -1603,31 +1656,101 @@ static bool SaveShortcuts(std::wstring& errorMessage)
     }
 
     // 以 UTF-16LE + BOM 写入，保证中文条目名在读写时保持一致。
-    HANDLE file = CreateFileW(configPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+    std::wstring temporaryPath = configPath + L".tmp." + std::to_wstring(GetCurrentProcessId());
+    HANDLE file = CreateFileW(temporaryPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE)
     {
         DWORD openError = GetLastError();
         errorMessage = L"The shortcuts configuration could not be saved. Check write access to shortcuts.ini.";
-        AppendDiagnosticLog(L"Unable to open shortcuts.ini for writing, error=" + std::to_wstring(openError));
+        AppendDiagnosticLog(L"Unable to open the temporary shortcuts file for writing, error=" + std::to_wstring(openError));
         return false;
     }
 
     const unsigned char bom[2] = { 0xFF, 0xFE };
-    DWORD written = 0;
-    BOOL saved = WriteFile(file, bom, sizeof(bom), &written, nullptr);
-    if (saved != FALSE)
-        saved = WriteFile(file, text.c_str(), static_cast<DWORD>(text.size() * sizeof(wchar_t)), &written, nullptr);
-    DWORD writeError = saved != FALSE ? ERROR_SUCCESS : GetLastError();
+    DWORD bomWritten = 0;
+    DWORD textWritten = 0;
+    DWORD textBytes = static_cast<DWORD>(text.size() * sizeof(wchar_t));
+    BOOL saved = WriteFile(file, bom, sizeof(bom), &bomWritten, nullptr);
+    if (saved != FALSE && bomWritten == sizeof(bom))
+        saved = WriteFile(file, text.c_str(), textBytes, &textWritten, nullptr);
+    if (saved != FALSE && textWritten == textBytes)
+        saved = FlushFileBuffers(file);
+    DWORD writeError = ERROR_SUCCESS;
+    if (saved == FALSE)
+        writeError = GetLastError();
+    else if (bomWritten != sizeof(bom) || textWritten != textBytes)
+        writeError = ERROR_WRITE_FAULT;
     CloseHandle(file);
 
-    if (saved == FALSE)
+    if (saved == FALSE || bomWritten != sizeof(bom) || textWritten != textBytes)
     {
+        DeleteFileW(temporaryPath.c_str());
         errorMessage = L"The shortcuts configuration could not be saved. Check write access to shortcuts.ini.";
         AppendDiagnosticLog(L"Unable to save shortcuts.ini, error=" + std::to_wstring(writeError));
         return false;
     }
+
+    if (MoveFileExW(temporaryPath.c_str(), configPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == FALSE)
+    {
+        DWORD replaceError = GetLastError();
+        DeleteFileW(temporaryPath.c_str());
+        errorMessage = L"The shortcuts configuration could not be replaced. Check write access to shortcuts.ini.";
+        AppendDiagnosticLog(L"Unable to replace shortcuts.ini, error=" + std::to_wstring(replaceError));
+        return false;
+    }
     return true;
+}
+
+static void ClearShortcuts(HWND hWnd)
+{
+    HWND owner = hWnd;
+    if (MessageBoxW(owner, L"Clear all shortcuts? Custom changes will be lost.", L"Clear Shortcuts",
+        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+        return;
+
+    std::vector<ShortcutItem> previous = g_shortcuts;
+    g_shortcuts.clear();
+    std::wstring errorMessage;
+    if (!SaveShortcuts(errorMessage))
+    {
+        g_shortcuts = std::move(previous);
+        MessageBoxW(owner, errorMessage.c_str(), L"Shortcuts", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    AppendDiagnosticLog(L"All shortcuts cleared");
+    RebuildShortcutPanel(hWnd);
+}
+
+static void ResetShortcuts(HWND hWnd)
+{
+    HWND owner = hWnd;
+    if (MessageBoxW(owner, L"Reset all shortcuts to the built-in defaults?", L"Reset Shortcuts",
+        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+        return;
+
+    std::vector<ShortcutItem> defaults;
+    if (!LoadDefaultShortcuts(defaults))
+    {
+        MessageBoxW(owner, L"The built-in shortcut defaults could not be loaded.", L"Shortcuts",
+            MB_OK | MB_ICONERROR);
+        AppendDiagnosticLog(L"Unable to load the built-in shortcut defaults");
+        return;
+    }
+
+    std::vector<ShortcutItem> previous = g_shortcuts;
+    g_shortcuts = std::move(defaults);
+    std::wstring errorMessage;
+    if (!SaveShortcuts(errorMessage))
+    {
+        g_shortcuts = std::move(previous);
+        MessageBoxW(owner, errorMessage.c_str(), L"Shortcuts", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    AppendDiagnosticLog(L"Shortcuts reset to built-in defaults");
+    RebuildShortcutPanel(hWnd);
 }
 
 static bool AddShortcutItem(const std::wstring& name, const std::wstring& keys, std::wstring& errorMessage)
@@ -1920,11 +2043,17 @@ static LRESULT CALLBACK ShortcutPanelProc(HWND hWnd, UINT message, WPARAM wParam
     case WM_CREATE:
         g_shortcutAddButton = CreateWindowW(L"BUTTON", L"Add Shortcut", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             0, 0, 1, 1, hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SHORTCUT_ADD)), hInst, nullptr);
+        g_shortcutClearButton = CreateWindowW(L"BUTTON", L"Clear All", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            0, 0, 1, 1, hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SHORTCUT_CLEAR)), hInst, nullptr);
+        g_shortcutResetButton = CreateWindowW(L"BUTTON", L"Reset", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            0, 0, 1, 1, hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SHORTCUT_RESET)), hInst, nullptr);
         g_shortcutCloseButton = CreateMainButton(hWnd, L"×", ID_SHORTCUT_CLOSE);
         g_shortcutMinimizeButton = CreateMainButton(hWnd, L"—", ID_SHORTCUT_MINIMIZE);
         g_shortcutHintText = CreateWindowW(L"STATIC", L"Drag empty space to move, drag an edge to resize.",
             WS_CHILD | WS_VISIBLE, 0, 0, 1, 1, hWnd, nullptr, hInst, nullptr);
         SendMessageW(g_shortcutAddButton, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+        SendMessageW(g_shortcutClearButton, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+        SendMessageW(g_shortcutResetButton, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
         SendMessageW(g_shortcutHintText, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
         ShowScrollBar(hWnd, SB_VERT, FALSE);
         g_shortcutScrollVisible = false;
@@ -2003,6 +2132,11 @@ static LRESULT CALLBACK ShortcutPanelProc(HWND hWnd, UINT message, WPARAM wParam
             if (item == nullptr || item->CtlType != ODT_BUTTON)
                 break;
             int controlId = static_cast<int>(item->CtlID);
+            if (controlId == ID_SHORTCUT_MINIMIZE || controlId == ID_SHORTCUT_CLOSE)
+            {
+                DrawMainButton(item);
+                return TRUE;
+            }
             int hoverState = SHORTCUT_HOVER_NONE;
             if (controlId >= ID_SHORTCUT_SEND_BASE &&
                 static_cast<size_t>(controlId - ID_SHORTCUT_SEND_BASE) < g_shortcutButtonHover.size())
@@ -2094,6 +2228,16 @@ static LRESULT CALLBACK ShortcutPanelProc(HWND hWnd, UINT message, WPARAM wParam
                 ShowAddShortcutDialog(hWnd);
                 return 0;
             }
+            if (commandId == ID_SHORTCUT_CLEAR)
+            {
+                ClearShortcuts(hWnd);
+                return 0;
+            }
+            if (commandId == ID_SHORTCUT_RESET)
+            {
+                ResetShortcuts(hWnd);
+                return 0;
+            }
             if (commandId == ID_SHORTCUT_REORDER)
             {
                 // 起止下标通过 lParam 传递，避免和按钮通知里作为控件句柄的 lParam 混淆。
@@ -2120,6 +2264,8 @@ static LRESULT CALLBACK ShortcutPanelProc(HWND hWnd, UINT message, WPARAM wParam
         return 0;
     case WM_DESTROY:
         g_shortcutAddButton = nullptr;
+        g_shortcutClearButton = nullptr;
+        g_shortcutResetButton = nullptr;
         g_shortcutCloseButton = nullptr;
         g_shortcutMinimizeButton = nullptr;
         g_shortcutHintText = nullptr;
@@ -2156,7 +2302,7 @@ static void RegisterShortcutPanelClass(HINSTANCE instance)
     RegisterClassExW(&wcex);
 }
 
-static void CreateShortcutPanel(HWND owner)
+static void CreateShortcutPanel()
 {
     if (g_shortcutWindow != nullptr)
         return;
@@ -2177,7 +2323,7 @@ static void CreateShortcutPanel(HWND owner)
     int windowHeight = 0;
     AdjustShortcutPanelWindowRect(clientWidth, clientHeight, windowWidth, windowHeight);
     g_shortcutWindow = CreateWindowExW(SHORTCUT_PANEL_EX_STYLE, SHORTCUT_PANEL_CLASS, L"Shortcuts",
-        SHORTCUT_PANEL_STYLE, workArea.left + 40, workArea.top + 40, windowWidth, windowHeight, owner,
+        SHORTCUT_PANEL_STYLE, workArea.left + 40, workArea.top + 40, windowWidth, windowHeight, nullptr,
         nullptr, hInst, nullptr);
     if (g_shortcutWindow == nullptr)
     {
@@ -2199,11 +2345,11 @@ static void CreateShortcutPanel(HWND owner)
     RefreshShortcutPanel(g_shortcutWindow);
 }
 
-static void ToggleShortcutPanel(HWND owner)
+static void ToggleShortcutPanel()
 {
     if (g_shortcutWindow == nullptr)
     {
-        CreateShortcutPanel(owner);
+        CreateShortcutPanel();
         return;
     }
     ShowWindow(g_shortcutWindow, IsWindowVisible(g_shortcutWindow) ? SW_HIDE : SW_SHOWNOACTIVATE);
@@ -2491,6 +2637,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         g_copyLogsButton = CreateMainButton(hWnd, L"Copy Logs", ID_COPY_LOGS);
         g_shortcutPanelButton = CreateMainButton(hWnd, L"Shortcuts", ID_SHORTCUT_PANEL_BUTTON);
         g_settingsButton = CreateMainButton(hWnd, L"Settings", ID_MAIN_SETTINGS);
+        g_programExitButton = CreateMainButton(hWnd, L"Exit Program", ID_MAIN_EXIT_PROGRAM);
         g_mainMinimizeButton = CreateMainButton(hWnd, L"—", ID_MAIN_MINIMIZE);
         g_mainCloseButton = CreateMainButton(hWnd, L"×", ID_MAIN_CLOSE);
         g_processList = CreateWindowW(WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
@@ -2598,7 +2745,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             if (wmId == ID_REQUEST_EXIT) { RequestSelectedExit(hWnd); return 0; }
             if (wmId == ID_TASKBAR_MENU) { RequestSelectedTaskbarMenu(); return 0; }
             if (wmId == ID_COPY_LOGS) { CopyDiagnosticLogs(); return 0; }
-            if (wmId == ID_SHORTCUT_PANEL_BUTTON) { ToggleShortcutPanel(hWnd); return 0; }
+            if (wmId == ID_SHORTCUT_PANEL_BUTTON) { ToggleShortcutPanel(); return 0; }
+            if (wmId == ID_MAIN_EXIT_PROGRAM) { DestroyWindow(hWnd); return 0; }
             if (wmId == ID_MAIN_SETTINGS)
             {
                 g_settingsOpen = true;
@@ -2615,7 +2763,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             }
             if (wmId == IDM_SHORTCUTS)
             {
-                ToggleShortcutPanel(hWnd);
+                ToggleShortcutPanel();
                 return 0;
             }
             // 分析菜单选择:
