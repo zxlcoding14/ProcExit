@@ -1005,7 +1005,7 @@ static constexpr int SHORTCUT_PANEL_FOOTER = 28;
 static constexpr int SHORTCUT_PANEL_TITLE_BAR_HEIGHT = 32;
 static constexpr int SHORTCUT_MIN_COLUMNS = 3;
 static constexpr int SHORTCUT_MIN_ROWS = 3;
-static constexpr int SHORTCUT_INITIAL_COLUMNS = 10;
+static constexpr int SHORTCUT_INITIAL_COLUMNS = 5;
 // WS_CLIPCHILDREN 让父窗口不再重画按钮占用的区域，重建和排版时不会闪白。
 static constexpr DWORD SHORTCUT_PANEL_STYLE = WS_POPUP | WS_THICKFRAME | WS_VSCROLL | WS_CLIPCHILDREN;
 static constexpr DWORD SHORTCUT_PANEL_EX_STYLE = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
@@ -1939,7 +1939,7 @@ static bool ShouldCaptureShortcutKey(WORD key)
 {
     if (IsShortcutModifierKey(key)) return true;
     if (IsShortcutModifierDown()) return true;
-    if (key == VK_TAB || key == VK_RETURN || key == VK_ESCAPE || key == VK_BACK) return false;
+    if (key == VK_BACK) return false;
     if (key == VK_SPACE || (key >= L'0' && key <= L'9') || (key >= L'A' && key <= L'Z')) return false;
     return true;
 }
