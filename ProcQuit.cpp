@@ -57,6 +57,12 @@ static HWND g_statusText = nullptr;
 static HWND g_processList = nullptr;
 static HWND g_refreshButton = nullptr;
 static HWND g_exitButton = nullptr;
+static HWND g_terminateButton = nullptr;
+static HWND g_taskbarOnlyCheck = nullptr;
+static HWND g_processSearch = nullptr;
+static bool g_refreshingProcesses = false;
+static int g_sortColumn = 0;
+static bool g_sortDescending = false;
 static HWND g_taskbarMenuButton = nullptr;
 static HWND g_copyLogsButton = nullptr;
 static HWND g_shortcutPanelButton = nullptr;
@@ -85,6 +91,13 @@ static constexpr int ID_MAIN_SETTINGS = 1913;
 static constexpr int ID_SHORTCUT_CLEAR = 1915;
 static constexpr int ID_SHORTCUT_RESET = 1916;
 static constexpr int ID_MAIN_EXIT_PROGRAM = 1917;
+static constexpr int ID_TERMINATE_PROCESS = 1918;
+static constexpr int ID_TASKBAR_ONLY = 1919;
+static constexpr int ID_PROCESS_SEARCH = 1920;
+static constexpr int ID_COPY_NAME = 1921;
+static constexpr int ID_COPY_PATH = 1922;
+static constexpr int ID_COPY_COMMAND = 1923;
+static constexpr int ID_OPEN_PATH = 1924;
 static constexpr int MAIN_TITLE_BAR_HEIGHT = 32;
 static constexpr int ID_SHORTCUT_SEND_BASE = 2000;
 static constexpr int ID_SHORTCUT_DELETE_BASE = 3000;
@@ -130,8 +143,78 @@ struct ProcessRow
     std::wstring name;
     std::wstring title;
     HWND window;
+    std::wstring directory;
+    std::wstring commandLine;
 };
 static std::vector<ProcessRow> g_processes;
+static std::vector<ProcessRow> g_allProcesses;
+
+static void CopyTextToClipboard(const std::wstring& text)
+{
+    if (text.empty() || text == L"Unavailable" || !OpenClipboard(nullptr)) return;
+    const SIZE_T bytes = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (memory == nullptr) { CloseClipboard(); return; }
+    auto* target = static_cast<wchar_t*>(GlobalLock(memory));
+    if (target == nullptr) { GlobalFree(memory); CloseClipboard(); return; }
+    memcpy(target, text.c_str(), bytes);
+    GlobalUnlock(memory);
+    EmptyClipboard();
+    if (SetClipboardData(CF_UNICODETEXT, memory) == nullptr) GlobalFree(memory);
+    CloseClipboard();
+}
+
+static void ShowProcessContextMenu(HWND hWnd, int index, POINT point)
+{
+    if (index < 0 || index >= static_cast<int>(g_processes.size())) return;
+    const ProcessRow target = g_processes[index];
+    ListView_SetItemState(g_processList, index, LVIS_SELECTED, LVIS_SELECTED);
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, ID_COPY_NAME, L"Copy name");
+    AppendMenuW(menu, MF_STRING, ID_COPY_PATH, L"Copy path");
+    AppendMenuW(menu, MF_STRING, ID_COPY_COMMAND, L"Copy command line");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, ID_OPEN_PATH, L"Open process location");
+    const int command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+        point.x, point.y, 0, hWnd, nullptr);
+    DestroyMenu(menu);
+    if (command == ID_COPY_NAME) CopyTextToClipboard(target.name);
+    else if (command == ID_COPY_PATH) CopyTextToClipboard(target.directory);
+    else if (command == ID_COPY_COMMAND) CopyTextToClipboard(target.commandLine);
+    else if (command == ID_OPEN_PATH && target.directory != L"Unavailable")
+        ShellExecuteW(hWnd, L"open", target.directory.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+static std::vector<ProcessRow> GetSelectedProcesses()
+{
+    std::vector<ProcessRow> targets;
+    for (int index = 0; index < static_cast<int>(g_processes.size()); ++index)
+        if (ListView_GetCheckState(g_processList, index) ||
+            (ListView_GetItemState(g_processList, index, LVIS_SELECTED) & LVIS_SELECTED) != 0)
+            targets.push_back(g_processes[index]);
+    return targets;
+}
+
+static std::wstring ReadProcessCommandLine(HANDLE process)
+{
+    using QueryProcess = LONG (NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static const auto query = reinterpret_cast<QueryProcess>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+    if (query == nullptr) return L"Unavailable";
+    struct CommandLineString { USHORT length; USHORT maximumLength; PWSTR buffer; };
+    ULONG required = 0;
+    query(process, 60, nullptr, 0, &required);
+    if (required < sizeof(CommandLineString) || required > 1024 * 1024) return L"Unavailable";
+    std::vector<BYTE> data(required);
+    if (query(process, 60, data.data(), required, &required) < 0) return L"Unavailable";
+    const auto* text = reinterpret_cast<const CommandLineString*>(data.data());
+    ULONG_PTR begin = reinterpret_cast<ULONG_PTR>(data.data());
+    ULONG_PTR pointer = reinterpret_cast<ULONG_PTR>(text->buffer);
+    if (text->length % sizeof(wchar_t) != 0 || pointer < begin ||
+        pointer - begin > data.size() || text->length > data.size() - (pointer - begin))
+        return L"Unavailable";
+    return std::wstring(text->buffer, text->length / sizeof(wchar_t));
+}
 
 static std::wstring ToLower(std::wstring value)
 {
@@ -390,17 +473,12 @@ static bool IsCurrentWindowInstance(const ProcessRow& target)
         IsCurrentProcessInstance(target);
 }
 
-static void RequestSelectedTaskbarMenu()
+static bool RequestTaskbarMenu(const ProcessRow& target)
 {
-    int selected = ListView_GetNextItem(g_processList, -1, LVNI_SELECTED);
-    if (selected < 0 || static_cast<size_t>(selected) >= g_processes.size())
-        return;
-
-    const ProcessRow& target = g_processes[selected];
     if (!IsCurrentWindowInstance(target))
     {
         SetWindowTextW(g_statusText, L"The selected window is no longer available. Refresh the list.");
-        return;
+        return false;
     }
 
     IUIAutomation* automation = nullptr;
@@ -416,12 +494,23 @@ static void RequestSelectedTaskbarMenu()
         {
             AppendDiagnosticLog(L"Taskbar button right-click sent for PID " + std::to_wstring(target.pid));
             SetWindowTextW(g_statusText, L"Taskbar icon right-click sent.");
-            return;
+            return true;
         }
     }
 
     AppendDiagnosticLog(L"Unable to identify a unique taskbar button for PID " + std::to_wstring(target.pid));
     SetWindowTextW(g_statusText, L"Unable to identify a unique taskbar button for the selected window.");
+    return false;
+}
+
+static void RequestSelectedTaskbarMenu()
+{
+    size_t sent = 0;
+    const auto targets = GetSelectedProcesses();
+    for (const auto& target : targets)
+        if (RequestTaskbarMenu(target)) ++sent;
+    SetWindowTextW(g_statusText, (L"Taskbar right-click sent: " + std::to_wstring(sent) +
+        L" / " + std::to_wstring(targets.size()) + L". Only the last menu can remain open.").c_str());
 }
 
 static void CopyDiagnosticLogs()
@@ -444,20 +533,101 @@ static void UpdateExitButton()
     if (g_processList == nullptr)
         return;
 
-    bool hasSelection = ListView_GetNextItem(g_processList, -1, LVNI_SELECTED) >= 0;
+    bool hasSelection = false;
+    for (int index = 0; index < ListView_GetItemCount(g_processList) && !hasSelection; ++index)
+        hasSelection = ListView_GetCheckState(g_processList, index) != FALSE ||
+            (ListView_GetItemState(g_processList, index, LVIS_SELECTED) & LVIS_SELECTED) != 0;
     if (g_exitButton != nullptr)
         EnableWindow(g_exitButton, !g_exitPending && hasSelection);
     if (g_taskbarMenuButton != nullptr)
         EnableWindow(g_taskbarMenuButton, !g_exitPending && hasSelection);
+    if (g_terminateButton != nullptr)
+        EnableWindow(g_terminateButton, !g_exitPending && hasSelection);
+}
+
+static void DisplayProcesses(bool preserveSelection = true)
+{
+    if (g_processList == nullptr) return;
+    const auto selected = preserveSelection ? GetSelectedProcesses() : std::vector<ProcessRow>();
+    const int length = GetWindowTextLengthW(g_processSearch);
+    std::vector<wchar_t> search(static_cast<size_t>(length) + 1);
+    GetWindowTextW(g_processSearch, search.data(), static_cast<int>(search.size()));
+    const std::wstring query = ToLower(search.data());
+    g_refreshingProcesses = true;
+    SendMessageW(g_processList, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(g_processList);
+    g_processes.clear();
+    for (const auto& target : g_allProcesses)
+    {
+        if (query.empty() || ToLower(target.name).find(query) != std::wstring::npos ||
+            std::to_wstring(target.pid).find(query) != std::wstring::npos ||
+            ToLower(target.directory).find(query) != std::wstring::npos ||
+            ToLower(target.commandLine).find(query) != std::wstring::npos ||
+            ToLower(target.title).find(query) != std::wstring::npos)
+            g_processes.push_back(target);
+    }
+    std::stable_sort(g_processes.begin(), g_processes.end(), [](const ProcessRow& left, const ProcessRow& right) {
+        int comparison = g_sortColumn == 1 ? (left.pid < right.pid ? -1 : left.pid > right.pid ? 1 : 0)
+            : _wcsicmp(left.name.c_str(), right.name.c_str());
+        if (comparison == 0) comparison = left.pid < right.pid ? -1 : left.pid > right.pid ? 1 : 0;
+        return g_sortDescending ? comparison > 0 : comparison < 0;
+    });
+    for (const auto& target : g_processes)
+    {
+        LVITEMW item = {};
+        item.mask = LVIF_TEXT;
+        item.iItem = ListView_GetItemCount(g_processList);
+        item.pszText = const_cast<LPWSTR>(target.name.c_str());
+        int row = ListView_InsertItem(g_processList, &item);
+        std::wstring pid = std::to_wstring(target.pid);
+        ListView_SetItemText(g_processList, row, 1, const_cast<LPWSTR>(pid.c_str()));
+        ListView_SetItemText(g_processList, row, 2, const_cast<LPWSTR>(target.title.c_str()));
+        LPWSTR availability = target.creationTime && target.pid != GetCurrentProcessId()
+            ? const_cast<LPWSTR>(L"Ready") : const_cast<LPWSTR>(L"Unavailable");
+        ListView_SetItemText(g_processList, row, 3, availability);
+        ListView_SetItemText(g_processList, row, 4, const_cast<LPWSTR>(target.directory.c_str()));
+        ListView_SetItemText(g_processList, row, 5, const_cast<LPWSTR>(target.commandLine.c_str()));
+        for (const auto& previous : selected)
+            if (previous.pid == target.pid && previous.creationTime == target.creationTime)
+            {
+                ListView_SetCheckState(g_processList, row, TRUE);
+                ListView_SetItemState(g_processList, row, LVIS_SELECTED, LVIS_SELECTED);
+                break;
+            }
+    }
+    HWND header = ListView_GetHeader(g_processList);
+    for (int column = 0; column < 2; ++column)
+    {
+        HDITEMW item = {};
+        item.mask = HDI_FORMAT;
+        Header_GetItem(header, column, &item);
+        item.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
+        if (column == g_sortColumn) item.fmt |= g_sortDescending ? HDF_SORTDOWN : HDF_SORTUP;
+        Header_SetItem(header, column, &item);
+    }
+    SendMessageW(g_processList, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_processList, nullptr, TRUE);
+    g_refreshingProcesses = false;
+    UpdateExitButton();
+    SetWindowTextW(g_statusText, (L"Showing " + std::to_wstring(g_processes.size()) +
+        L" / " + std::to_wstring(g_allProcesses.size()) + L" processes.").c_str());
 }
 
 static void RefreshProcesses()
 {
     if (g_processList == nullptr) return;
-    ListView_DeleteAllItems(g_processList);
-    g_processes.clear();
+    g_allProcesses.clear();
 
-    std::unordered_map<DWORD, std::wstring> processNames;
+    std::unordered_map<DWORD, HWND> taskbarWindows;
+    std::vector<HWND> windows;
+    EnumWindows(CollectTaskbarApplications, reinterpret_cast<LPARAM>(&windows));
+    for (HWND window : windows)
+    {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(window, &pid);
+        taskbarWindows.emplace(pid, window);
+    }
+    const bool taskbarOnly = SendMessageW(g_taskbarOnlyCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot != INVALID_HANDLE_VALUE)
     {
@@ -467,73 +637,97 @@ static void RefreshProcesses()
         {
             do
             {
-                processNames.emplace(entry.th32ProcessID, entry.szExeFile);
+                auto window = taskbarWindows.find(entry.th32ProcessID);
+                if (taskbarOnly && window == taskbarWindows.end()) continue;
+                ProcessRow target = {};
+                target.pid = entry.th32ProcessID;
+                target.name = entry.szExeFile;
+                target.window = window == taskbarWindows.end() ? nullptr : window->second;
+                target.title = GetWindowTitle(target.window);
+                target.directory = L"Unavailable";
+                target.commandLine = L"Unavailable";
+                HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, target.pid);
+                if (process != nullptr)
+                {
+                    FILETIME start = {}, end = {}, kernel = {}, user = {};
+                    if (GetProcessTimes(process, &start, &end, &kernel, &user))
+                    {
+                        ULARGE_INTEGER value = {};
+                        value.LowPart = start.dwLowDateTime;
+                        value.HighPart = start.dwHighDateTime;
+                        target.creationTime = value.QuadPart;
+                    }
+                    std::vector<wchar_t> path(32768);
+                    DWORD length = static_cast<DWORD>(path.size());
+                    if (QueryFullProcessImageNameW(process, 0, path.data(), &length))
+                    {
+                        target.directory.assign(path.data(), length);
+                        size_t slash = target.directory.find_last_of(L"\\/");
+                        if (slash != std::wstring::npos) target.directory.resize(slash + 1);
+                    }
+                    target.commandLine = ReadProcessCommandLine(process);
+                    CloseHandle(process);
+                }
+                g_allProcesses.push_back(std::move(target));
             } while (Process32NextW(snapshot, &entry));
         }
         CloseHandle(snapshot);
     }
 
-    std::vector<HWND> windows;
-    EnumWindows(CollectTaskbarApplications, reinterpret_cast<LPARAM>(&windows));
-    for (HWND window : windows)
-    {
-        DWORD processId = 0;
-        GetWindowThreadProcessId(window, &processId);
-
-        ULONGLONG created = 0;
-        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
-        if (process != nullptr)
-        {
-            FILETIME start = {}, end = {}, kernel = {}, user = {};
-            if (GetProcessTimes(process, &start, &end, &kernel, &user))
-            {
-                ULARGE_INTEGER value = {};
-                value.LowPart = start.dwLowDateTime;
-                value.HighPart = start.dwHighDateTime;
-                created = value.QuadPart;
-            }
-            CloseHandle(process);
-        }
-
-        auto processName = processNames.find(processId);
-        std::wstring name = processName == processNames.end() ? L"Unknown" : processName->second;
-        std::wstring title = GetWindowTitle(window);
-        g_processes.push_back({ processId, created, name, title, window });
-
-        LVITEMW item = {};
-        item.mask = LVIF_TEXT;
-        item.iItem = static_cast<int>(g_processes.size() - 1);
-        item.pszText = const_cast<LPWSTR>(g_processes.back().name.c_str());
-        int row = ListView_InsertItem(g_processList, &item);
-        std::wstring pid = std::to_wstring(processId);
-        ListView_SetItemText(g_processList, row, 1, const_cast<LPWSTR>(pid.c_str()));
-        ListView_SetItemText(g_processList, row, 2, const_cast<LPWSTR>(g_processes.back().title.c_str()));
-        LPWSTR availability = created ? const_cast<LPWSTR>(L"Ready") : const_cast<LPWSTR>(L"Unavailable");
-        ListView_SetItemText(g_processList, row, 3, availability);
-    }
-
-    UpdateExitButton();
-    SetWindowTextW(g_statusText, (L"Showing " + std::to_wstring(g_processes.size()) + L" taskbar window candidates.").c_str());
-    AppendDiagnosticLog(L"Taskbar window candidates enumerated: " + std::to_wstring(g_processes.size()));
+    DisplayProcesses(false);
+    AppendDiagnosticLog(L"Processes enumerated: " + std::to_wstring(g_allProcesses.size()));
 }
 
-static void RequestSelectedExit(HWND hWnd)
+static void RequestSelectedExit(HWND hWnd, bool force = false)
 {
-    int selected = ListView_GetNextItem(g_processList, -1, LVNI_SELECTED);
-    if (g_exitPending || selected < 0 || static_cast<size_t>(selected) >= g_processes.size()) return;
-    ProcessRow target = g_processes[selected];
-    if (!target.creationTime || target.pid == GetCurrentProcessId())
-    {
-        SetWindowTextW(g_statusText, L"This process cannot be requested to exit.");
-        return;
-    }
+    if (g_exitPending) return;
+    auto targets = GetSelectedProcesses();
+    if (targets.empty()) return;
+    if (force && MessageBoxW(hWnd, L"Force terminate all selected processes? Unsaved data may be lost.",
+        L"Confirm termination", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
     if (g_exitWorker.joinable()) g_exitWorker.join();
     g_exitPending = true;
     UpdateExitButton();
-    SetWindowTextW(g_statusText, L"Requesting graceful exit...");
-    g_exitWorker = std::thread([hWnd, target]() {
-        GracefulExitResult result = RequestGracefulExit(target.pid, target.creationTime, 5000);
-        PostMessageW(hWnd, WM_EXIT_FINISHED, static_cast<WPARAM>(result.status), result.errorCode);
+    EnableWindow(g_refreshButton, FALSE);
+    EnableWindow(g_taskbarOnlyCheck, FALSE);
+    SetWindowTextW(g_statusText, force ? L"Terminating selected processes..." : L"Requesting graceful exit...");
+    g_exitWorker = std::thread([hWnd, targets = std::move(targets), force]() {
+        size_t completed = 0;
+        for (const auto& target : targets)
+        {
+            if (!target.creationTime || target.pid == GetCurrentProcessId() || target.pid <= 4)
+            {
+                AppendDiagnosticLog(L"Skipped unavailable or protected PID " + std::to_wstring(target.pid));
+                continue;
+            }
+            if (force)
+            {
+                HANDLE process = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                    FALSE, target.pid);
+                if (process != nullptr)
+                {
+                    FILETIME start = {}, end = {}, kernel = {}, user = {};
+                    ULARGE_INTEGER created = {};
+                    bool valid = GetProcessTimes(process, &start, &end, &kernel, &user) != FALSE;
+                    created.LowPart = start.dwLowDateTime;
+                    created.HighPart = start.dwHighDateTime;
+                    if (valid && created.QuadPart == target.creationTime && TerminateProcess(process, 1))
+                    {
+                        if (WaitForSingleObject(process, 5000) == WAIT_OBJECT_0) ++completed;
+                    }
+                    else
+                        AppendDiagnosticLog(L"Termination failed or instance changed for PID " +
+                            std::to_wstring(target.pid) + L", error=" + std::to_wstring(GetLastError()));
+                    CloseHandle(process);
+                }
+                else
+                    AppendDiagnosticLog(L"OpenProcess for termination failed for PID " +
+                        std::to_wstring(target.pid) + L", error=" + std::to_wstring(GetLastError()));
+            }
+            else if (RequestGracefulExit(target.pid, target.creationTime, 5000).status == GracefulExitStatus::Exited)
+                ++completed;
+        }
+        PostMessageW(hWnd, WM_EXIT_FINISHED, static_cast<WPARAM>(completed), static_cast<LPARAM>(targets.size()));
     });
 }
 
@@ -952,11 +1146,11 @@ static void LayoutMainWindow(HWND hWnd)
     const int margin = 12;
     const int buttonHeight = 28;
     int top = MAIN_TITLE_BAR_HEIGHT + 8;
-    int listTop = top + buttonHeight + 8;
+    int listTop = top + (buttonHeight + 8) * 2;
     int listHeight = client.bottom - listTop - 40;
     if (listHeight < 40) listHeight = 40;
 
-    HDWP defer = BeginDeferWindowPos(11);
+    HDWP defer = BeginDeferWindowPos(14);
     auto place = [&defer](HWND window, int x, int y, int width, int height) {
         if (window == nullptr || defer == nullptr) return;
         defer = DeferWindowPos(defer, window, nullptr, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -969,6 +1163,9 @@ static void LayoutMainWindow(HWND hWnd)
     place(g_copyLogsButton, margin + 410, top, 120, buttonHeight);
     place(g_shortcutPanelButton, margin + 540, top, 110, buttonHeight);
     place(g_settingsButton, margin + 660, top, 100, buttonHeight);
+    place(g_terminateButton, margin, top + buttonHeight + 8, 150, buttonHeight);
+    place(g_taskbarOnlyCheck, margin + 166, top + buttonHeight + 8, 220, buttonHeight);
+    place(g_processSearch, margin + 400, top + buttonHeight + 8, client.right - margin * 2 - 400, buttonHeight);
     place(g_processList, margin, listTop, client.right - margin * 2, listHeight);
     place(g_statusText, margin, client.bottom - 30, client.right - margin * 2 - 114, 20);
     place(g_programExitButton, client.right - margin - 104, client.bottom - 34, 104, 26);
@@ -2341,18 +2538,18 @@ static void CreateShortcutPanel()
             SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
-    ShowWindow(g_shortcutWindow, SW_SHOWNOACTIVATE);
     RefreshShortcutPanel(g_shortcutWindow);
 }
 
-static void ToggleShortcutPanel()
+static void ShowShortcutPanel()
 {
     if (g_shortcutWindow == nullptr)
-    {
         CreateShortcutPanel();
+    if (g_shortcutWindow == nullptr)
         return;
-    }
-    ShowWindow(g_shortcutWindow, IsWindowVisible(g_shortcutWindow) ? SW_HIDE : SW_SHOWNOACTIVATE);
+    ShowWindow(g_shortcutWindow, SW_SHOWNOACTIVATE);
+    SetWindowPos(g_shortcutWindow, HWND_TOP, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
@@ -2633,6 +2830,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         AppendDiagnosticLog(L"Application window created");
         g_refreshButton = CreateMainButton(hWnd, L"Refresh", ID_REFRESH);
         g_exitButton = CreateMainButton(hWnd, L"Request Exit", ID_REQUEST_EXIT);
+        g_terminateButton = CreateMainButton(hWnd, L"Force Terminate", ID_TERMINATE_PROCESS);
+        g_taskbarOnlyCheck = CreateWindowW(L"BUTTON", L"Taskbar processes only", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            0, 0, 1, 1, hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_TASKBAR_ONLY)), hInst, nullptr);
+        SendMessageW(g_taskbarOnlyCheck, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+        g_processSearch = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            0, 0, 1, 1, hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_PROCESS_SEARCH)), hInst, nullptr);
+        SendMessageW(g_processSearch, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+        SendMessageW(g_processSearch, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Search processes..."));
         g_taskbarMenuButton = CreateMainButton(hWnd, L"Right-click Taskbar", ID_TASKBAR_MENU);
         g_copyLogsButton = CreateMainButton(hWnd, L"Copy Logs", ID_COPY_LOGS);
         g_shortcutPanelButton = CreateMainButton(hWnd, L"Shortcuts", ID_SHORTCUT_PANEL_BUTTON);
@@ -2640,9 +2845,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         g_programExitButton = CreateMainButton(hWnd, L"Exit Program", ID_MAIN_EXIT_PROGRAM);
         g_mainMinimizeButton = CreateMainButton(hWnd, L"—", ID_MAIN_MINIMIZE);
         g_mainCloseButton = CreateMainButton(hWnd, L"×", ID_MAIN_CLOSE);
-        g_processList = CreateWindowW(WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        g_processList = CreateWindowW(WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | LVS_REPORT | LVS_SHOWSELALWAYS,
             0, 0, 1, 1, hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_PROCESS_LIST)), hInst, nullptr);
-        ListView_SetExtendedListViewStyle(g_processList, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+        ListView_SetExtendedListViewStyle(g_processList, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_CHECKBOXES);
         LVCOLUMNW column = { LVCF_TEXT | LVCF_WIDTH, 0, 230, const_cast<LPWSTR>(L"Name") };
         ListView_InsertColumn(g_processList, 0, &column);
         column.cx = 90; column.pszText = const_cast<LPWSTR>(L"PID");
@@ -2651,6 +2856,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         ListView_InsertColumn(g_processList, 2, &column);
         column.cx = 120; column.pszText = const_cast<LPWSTR>(L"Exit availability");
         ListView_InsertColumn(g_processList, 3, &column);
+        column.cx = 300; column.pszText = const_cast<LPWSTR>(L"Process directory");
+        ListView_InsertColumn(g_processList, 4, &column);
+        column.cx = 480; column.pszText = const_cast<LPWSTR>(L"Command line");
+        ListView_InsertColumn(g_processList, 5, &column);
         LoadShortcuts();
         if (LoadMouseTrigger())
         {
@@ -2670,7 +2879,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         return 0;
     }
     case WM_GETMINMAXINFO:
-        reinterpret_cast<MINMAXINFO*>(lParam)->ptMinTrackSize.x = 680;
+        reinterpret_cast<MINMAXINFO*>(lParam)->ptMinTrackSize.x = 800;
         reinterpret_cast<MINMAXINFO*>(lParam)->ptMinTrackSize.y = 340;
         return 0;
     case WM_NCHITTEST:
@@ -2707,20 +2916,73 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         return reinterpret_cast<LRESULT>(GetStockObject(WHITE_BRUSH));
     case WM_NOTIFY:
         if (reinterpret_cast<NMHDR*>(lParam)->idFrom == ID_PROCESS_LIST &&
-            reinterpret_cast<NMHDR*>(lParam)->code == LVN_ITEMCHANGED)
+            reinterpret_cast<NMHDR*>(lParam)->code == LVN_COLUMNCLICK)
+        {
+            const int column = reinterpret_cast<NMLISTVIEW*>(lParam)->iSubItem;
+            if (column == 0 || column == 1)
+            {
+                g_sortDescending = column == g_sortColumn ? !g_sortDescending : false;
+                g_sortColumn = column;
+                DisplayProcesses();
+            }
+            return 0;
+        }
+        if (reinterpret_cast<NMHDR*>(lParam)->idFrom == ID_PROCESS_LIST &&
+            reinterpret_cast<NMHDR*>(lParam)->code == LVN_ITEMCHANGED && !g_refreshingProcesses)
+        {
+            static bool syncing = false;
+            auto* change = reinterpret_cast<NMLISTVIEW*>(lParam);
+            if (!syncing && change->iItem >= 0 && (change->uChanged & LVIF_STATE) != 0)
+            {
+                syncing = true;
+                if ((change->uOldState & LVIS_STATEIMAGEMASK) != (change->uNewState & LVIS_STATEIMAGEMASK))
+                {
+                    ListView_SetItemState(g_processList, change->iItem,
+                        ListView_GetCheckState(g_processList, change->iItem) ? LVIS_SELECTED : 0, LVIS_SELECTED);
+                }
+                else if ((change->uOldState & LVIS_SELECTED) != (change->uNewState & LVIS_SELECTED))
+                {
+                    ListView_SetCheckState(g_processList, change->iItem, (change->uNewState & LVIS_SELECTED) != 0);
+                }
+                syncing = false;
+            }
             UpdateExitButton();
+        }
         return 0;
+    case WM_CONTEXTMENU:
+        if (reinterpret_cast<HWND>(wParam) == g_processList)
+        {
+            POINT point = { static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam)) };
+            int index = -1;
+            if (point.x == -1 && point.y == -1)
+            {
+                index = ListView_GetNextItem(g_processList, -1, LVNI_FOCUSED);
+                RECT bounds = {};
+                if (index >= 0 && ListView_GetItemRect(g_processList, index, &bounds, LVIR_BOUNDS))
+                {
+                    point = { bounds.left, bounds.bottom };
+                    ClientToScreen(g_processList, &point);
+                }
+            }
+            else
+            {
+                LVHITTESTINFO hit = {};
+                hit.pt = point;
+                ScreenToClient(g_processList, &hit.pt);
+                index = ListView_HitTest(g_processList, &hit);
+            }
+            ShowProcessContextMenu(hWnd, index, point);
+            return 0;
+        }
+        break;
     case WM_EXIT_FINISHED:
         if (g_exitWorker.joinable()) g_exitWorker.join();
         g_exitPending = false;
-        switch (static_cast<GracefulExitStatus>(wParam))
-        {
-        case GracefulExitStatus::Exited: SetWindowTextW(g_statusText, L"Process exited."); break;
-        case GracefulExitStatus::StillRunning: SetWindowTextW(g_statusText, L"Process is still running."); break;
-        case GracefulExitStatus::Unsupported: SetWindowTextW(g_statusText, L"No supported exit window found."); break;
-        default: SetWindowTextW(g_statusText, L"Unable to request graceful exit."); break;
-        }
-        UpdateExitButton();
+        EnableWindow(g_refreshButton, TRUE);
+        EnableWindow(g_taskbarOnlyCheck, TRUE);
+        RefreshProcesses();
+        SetWindowTextW(g_statusText, (L"Batch completed. Exited: " + std::to_wstring(wParam) +
+            L" / " + std::to_wstring(lParam) + L". See logs for failures or unsupported processes.").c_str());
         return 0;
     case WM_HOTKEY:
         if (wParam == ID_MOUSE_TRIGGER_HOTKEY && g_mouseTriggerRegistered && !g_settingsOpen)
@@ -2739,13 +3001,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_COMMAND:
         {
             int wmId = LOWORD(wParam);
+            if (wmId == ID_PROCESS_SEARCH && HIWORD(wParam) == EN_CHANGE)
+            {
+                DisplayProcesses();
+                return 0;
+            }
             if (wmId == ID_MAIN_MINIMIZE) { ShowWindow(hWnd, SW_MINIMIZE); return 0; }
             if (wmId == ID_MAIN_CLOSE) { HideMainWindow(hWnd); return 0; }
             if (wmId == ID_REFRESH) { RefreshProcesses(); return 0; }
             if (wmId == ID_REQUEST_EXIT) { RequestSelectedExit(hWnd); return 0; }
+            if (wmId == ID_TERMINATE_PROCESS) { RequestSelectedExit(hWnd, true); return 0; }
+            if (wmId == ID_TASKBAR_ONLY) { if (!g_exitPending) RefreshProcesses(); return 0; }
             if (wmId == ID_TASKBAR_MENU) { RequestSelectedTaskbarMenu(); return 0; }
             if (wmId == ID_COPY_LOGS) { CopyDiagnosticLogs(); return 0; }
-            if (wmId == ID_SHORTCUT_PANEL_BUTTON) { ToggleShortcutPanel(); return 0; }
+            if (wmId == ID_SHORTCUT_PANEL_BUTTON) { ShowShortcutPanel(); return 0; }
             if (wmId == ID_MAIN_EXIT_PROGRAM) { DestroyWindow(hWnd); return 0; }
             if (wmId == ID_MAIN_SETTINGS)
             {
@@ -2763,7 +3032,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             }
             if (wmId == IDM_SHORTCUTS)
             {
-                ToggleShortcutPanel();
+                ShowShortcutPanel();
                 return 0;
             }
             // 分析菜单选择:
