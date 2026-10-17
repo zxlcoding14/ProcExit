@@ -30,6 +30,11 @@
     <ClInclude Include="ProcessExit.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="MainWindow.h"><Filter>头文件</Filter></ClInclude>
+    <ClInclude Include="MouseTrigger.h"><Filter>头文件</Filter></ClInclude>
+    <ClInclude Include="ShortcutPanel.h"><Filter>头文件</Filter></ClInclude>
+    <ClInclude Include="ShortcutConfig.h"><Filter>头文件</Filter></ClInclude>
+    <ClInclude Include="WindowControls.h"><Filter>头文件</Filter></ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="ProcQuit.cpp">
@@ -38,6 +43,11 @@
     <ClCompile Include="ProcessExit.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="MainWindow.cpp"><Filter>源文件</Filter></ClCompile>
+    <ClCompile Include="MouseTrigger.cpp"><Filter>源文件</Filter></ClCompile>
+    <ClCompile Include="ShortcutPanel.cpp"><Filter>源文件</Filter></ClCompile>
+    <ClCompile Include="ShortcutConfig.cpp"><Filter>源文件</Filter></ClCompile>
+    <ClCompile Include="WindowControls.cpp"><Filter>源文件</Filter></ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="ProcQuit.rc">

@@ -13,3 +13,13 @@
 #include <malloc.h>
 #include <memory.h>
 #include <tchar.h>
+
+inline UINT GetWindowDpi(HWND hWnd)
+{
+    return hWnd != nullptr ? GetDpiForWindow(hWnd) : GetDpiForSystem();
+}
+
+inline int ScaleForDpi(HWND hWnd, int value)
+{
+    return MulDiv(value, static_cast<int>(GetWindowDpi(hWnd)), 96);
+}

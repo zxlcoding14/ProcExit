@@ -146,12 +146,22 @@
     <ClInclude Include="framework.h" />
     <ClInclude Include="ProcQuit.h" />
     <ClInclude Include="ProcessExit.h" />
+    <ClInclude Include="MainWindow.h" />
+    <ClInclude Include="MouseTrigger.h" />
+    <ClInclude Include="ShortcutPanel.h" />
+    <ClInclude Include="ShortcutConfig.h" />
+    <ClInclude Include="WindowControls.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="targetver.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="ProcQuit.cpp" />
     <ClCompile Include="ProcessExit.cpp" />
+    <ClCompile Include="MainWindow.cpp" />
+    <ClCompile Include="MouseTrigger.cpp" />
+    <ClCompile Include="ShortcutPanel.cpp" />
+    <ClCompile Include="ShortcutConfig.cpp" />
+    <ClCompile Include="WindowControls.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="ProcQuit.rc" />
