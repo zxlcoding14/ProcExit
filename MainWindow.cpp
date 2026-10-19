@@ -75,6 +75,8 @@ static constexpr int ID_COPY_NAME = 1921;
 static constexpr int ID_COPY_PATH = 1922;
 static constexpr int ID_COPY_COMMAND = 1923;
 static constexpr int ID_OPEN_PATH = 1924;
+static constexpr int ID_TERMINATE_TREE = 1925;
+static constexpr int ID_PROCESS_PROPERTIES = 1926;
 static constexpr int MAIN_TITLE_BAR_HEIGHT = 32;
 static bool g_settingsOpen = false;
 
@@ -95,9 +97,12 @@ struct ProcessRow
     HWND window;
     std::wstring directory;
     std::wstring commandLine;
+    std::wstring executablePath;
 };
 static std::vector<ProcessRow> g_processes;
 static std::vector<ProcessRow> g_allProcesses;
+static void RequestProcessExit(HWND hWnd, std::vector<ProcessRow> targets, bool force, bool tree);
+static bool IsCurrentProcessInstance(const ProcessRow& target);
 
 static void CopyTextToClipboard(const std::wstring& text)
 {
@@ -120,19 +125,48 @@ static void ShowProcessContextMenu(HWND hWnd, int index, POINT point)
     const ProcessRow target = g_processes[index];
     ListView_SetItemState(g_processList, index, LVIS_SELECTED, LVIS_SELECTED);
     HMENU menu = CreatePopupMenu();
+    if (menu == nullptr) return;
+    const UINT terminateFlags = MF_STRING | ((!g_exitPending && target.creationTime != 0 &&
+        target.pid > 4 && target.pid != GetCurrentProcessId()) ? MF_ENABLED : MF_GRAYED);
+    const UINT pathFlags = MF_STRING | (target.executablePath.empty() ? MF_GRAYED : MF_ENABLED);
+    AppendMenuW(menu, terminateFlags, ID_TERMINATE_PROCESS, L"End process...");
+    AppendMenuW(menu, terminateFlags, ID_TERMINATE_TREE, L"End process tree...");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_COPY_NAME, L"Copy name");
     AppendMenuW(menu, MF_STRING, ID_COPY_PATH, L"Copy path");
     AppendMenuW(menu, MF_STRING, ID_COPY_COMMAND, L"Copy command line");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, ID_OPEN_PATH, L"Open process location");
+    AppendMenuW(menu, pathFlags, ID_OPEN_PATH, L"Open file location");
+    AppendMenuW(menu, pathFlags, ID_PROCESS_PROPERTIES, L"Properties");
     const int command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
         point.x, point.y, 0, hWnd, nullptr);
     DestroyMenu(menu);
     if (command == ID_COPY_NAME) CopyTextToClipboard(target.name);
     else if (command == ID_COPY_PATH) CopyTextToClipboard(target.directory);
     else if (command == ID_COPY_COMMAND) CopyTextToClipboard(target.commandLine);
-    else if (command == ID_OPEN_PATH && target.directory != L"Unavailable")
-        ShellExecuteW(hWnd, L"open", target.directory.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    else if (command == ID_TERMINATE_PROCESS || command == ID_TERMINATE_TREE)
+        RequestProcessExit(hWnd, { target }, true, command == ID_TERMINATE_TREE);
+    else if (command == ID_OPEN_PATH || command == ID_PROCESS_PROPERTIES)
+    {
+        if (!IsCurrentProcessInstance(target))
+        {
+            SetWindowTextW(g_statusText, L"The selected process is no longer available. Refresh the list.");
+            return;
+        }
+        SHELLEXECUTEINFOW info = {};
+        info.cbSize = sizeof(info);
+        info.fMask = SEE_MASK_INVOKEIDLIST | SEE_MASK_FLAG_NO_UI;
+        info.hwnd = hWnd;
+        info.lpVerb = command == ID_PROCESS_PROPERTIES ? L"properties" : L"open";
+        info.lpFile = command == ID_PROCESS_PROPERTIES ? target.executablePath.c_str() : target.directory.c_str();
+        info.nShow = SW_SHOWNORMAL;
+        if (!ShellExecuteExW(&info))
+        {
+            const std::wstring error = L"Unable to open process location or properties. Error: " +
+                std::to_wstring(GetLastError());
+            SetWindowTextW(g_statusText, error.c_str());
+        }
+    }
 }
 
 static std::vector<ProcessRow> GetSelectedProcesses()
@@ -572,6 +606,7 @@ static void RefreshProcesses()
                     DWORD length = static_cast<DWORD>(path.size());
                     if (QueryFullProcessImageNameW(process, 0, path.data(), &length))
                     {
+                        target.executablePath.assign(path.data(), length);
                         target.directory.assign(path.data(), length);
                         size_t slash = target.directory.find_last_of(L"\\/");
                         if (slash != std::wstring::npos) target.directory.resize(slash + 1);
@@ -589,21 +624,112 @@ static void RefreshProcesses()
     AppendDiagnosticLog(L"Processes enumerated: " + std::to_wstring(g_allProcesses.size()));
 }
 
-static void RequestSelectedExit(HWND hWnd, bool force = false)
+static bool CollectProcessTree(const ProcessRow& root, std::vector<ProcessRow>& targets)
+{
+    using QueryProcess = LONG (NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static const auto query = reinterpret_cast<QueryProcess>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+    if (query == nullptr) return false;
+    if (!IsCurrentProcessInstance(root)) return false;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return false;
+    std::unordered_map<DWORD, std::vector<DWORD>> children;
+    PROCESSENTRY32W entry = {};
+    entry.dwSize = sizeof(entry);
+    bool complete = Process32FirstW(snapshot, &entry) != FALSE;
+    if (complete)
+    {
+        do
+        {
+            children[entry.th32ParentProcessID].push_back(entry.th32ProcessID);
+        } while (Process32NextW(snapshot, &entry));
+        complete = GetLastError() == ERROR_NO_MORE_FILES;
+    }
+    CloseHandle(snapshot);
+    if (!complete || !IsCurrentProcessInstance(root)) return false;
+    targets = { root };
+    std::unordered_map<DWORD, bool> visited;
+    visited.emplace(root.pid, true);
+    for (size_t index = 0; index < targets.size(); ++index)
+    {
+        const DWORD parentPid = targets[index].pid;
+        const ULONGLONG parentCreation = targets[index].creationTime;
+        if (parentCreation == 0) continue;
+        auto found = children.find(parentPid);
+        if (found == children.end()) continue;
+        for (DWORD pid : found->second)
+        {
+            if (pid <= 4 || pid == GetCurrentProcessId() || !visited.emplace(pid, true).second) continue;
+            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            FILETIME start = {}, end = {}, kernel = {}, user = {};
+            struct BasicInformation
+            {
+                LONG exitStatus;
+                PVOID peb;
+                ULONG_PTR affinity;
+                LONG basePriority;
+                ULONG_PTR processId;
+                ULONG_PTR parentId;
+            } basic = {};
+            if (process != nullptr && GetProcessTimes(process, &start, &end, &kernel, &user) &&
+                query(process, 0, &basic, sizeof(basic), nullptr) >= 0)
+            {
+                ULARGE_INTEGER created = {};
+                created.LowPart = start.dwLowDateTime;
+                created.HighPart = start.dwHighDateTime;
+                if (created.QuadPart >= parentCreation && basic.parentId == parentPid &&
+                    IsCurrentProcessInstance(targets[index]))
+                {
+                    ProcessRow child = {};
+                    child.pid = pid;
+                    child.creationTime = created.QuadPart;
+                    targets.push_back(std::move(child));
+                }
+            }
+            else
+            {
+                AppendDiagnosticLog(L"Unable to inspect process tree PID " + std::to_wstring(pid) +
+                    L", error=" + std::to_wstring(GetLastError()));
+                ProcessRow unavailable = {};
+                unavailable.pid = pid;
+                targets.push_back(std::move(unavailable));
+            }
+            if (process != nullptr) CloseHandle(process);
+        }
+    }
+    std::reverse(targets.begin(), targets.end());
+    return true;
+}
+
+static void RequestProcessExit(HWND hWnd, std::vector<ProcessRow> targets, bool force, bool tree)
 {
     if (g_exitPending) return;
-    auto targets = GetSelectedProcesses();
     if (targets.empty()) return;
-    if (force && MessageBoxW(hWnd, L"Force terminate all selected processes? Unsaved data may be lost.",
+    const std::wstring confirmation = tree
+        ? L"Force terminate this process and its descendants? Unsaved data may be lost.\n\nPID: " + std::to_wstring(targets.front().pid)
+        : L"Force terminate the specified processes? Unsaved data may be lost.\n\nProcess count: " + std::to_wstring(targets.size());
+    if (force && MessageBoxW(hWnd, confirmation.c_str(),
         L"Confirm termination", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
+    if (g_exitPending) return;
     if (g_exitWorker.joinable()) g_exitWorker.join();
     g_exitPending = true;
     UpdateExitButton();
     EnableWindow(g_refreshButton, FALSE);
     EnableWindow(g_taskbarOnlyCheck, FALSE);
     SetWindowTextW(g_statusText, force ? L"Terminating selected processes..." : L"Requesting graceful exit...");
-    g_exitWorker = std::thread([hWnd, targets = std::move(targets), force]() {
+    g_exitWorker = std::thread([hWnd, targets = std::move(targets), force, tree]() mutable {
         size_t completed = 0;
+        if (tree)
+        {
+            const ProcessRow root = targets.front();
+            if (!CollectProcessTree(root, targets))
+            {
+                AppendDiagnosticLog(L"Unable to capture process tree or root instance changed for PID " +
+                    std::to_wstring(root.pid));
+                PostMessageW(hWnd, WM_EXIT_FINISHED, 0, 1);
+                return;
+            }
+        }
         for (const auto& target : targets)
         {
             if (!target.creationTime || target.pid == GetCurrentProcessId() || target.pid <= 4)
@@ -620,6 +746,8 @@ static void RequestSelectedExit(HWND hWnd, bool force = false)
                     FILETIME start = {}, end = {}, kernel = {}, user = {};
                     ULARGE_INTEGER created = {};
                     bool valid = GetProcessTimes(process, &start, &end, &kernel, &user) != FALSE;
+                    BOOL critical = TRUE;
+                    valid = valid && IsProcessCritical(process, &critical) != FALSE && !critical;
                     created.LowPart = start.dwLowDateTime;
                     created.HighPart = start.dwHighDateTime;
                     if (valid && created.QuadPart == target.creationTime && TerminateProcess(process, 1))
@@ -640,6 +768,11 @@ static void RequestSelectedExit(HWND hWnd, bool force = false)
         }
         PostMessageW(hWnd, WM_EXIT_FINISHED, static_cast<WPARAM>(completed), static_cast<LPARAM>(targets.size()));
     });
+}
+
+static void RequestSelectedExit(HWND hWnd, bool force = false)
+{
+    RequestProcessExit(hWnd, GetSelectedProcesses(), force, false);
 }
 
 static void LayoutMainWindow(HWND hWnd)
